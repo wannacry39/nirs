@@ -1,0 +1,83 @@
+name: new-mcp-server
+
+# Архитектура запуска:
+#  - agent-b — MCP-сервер, поднимается фоном (docker compose up -d agent-b).
+#  - agent-a — интерактивный чат: запускается через `docker compose run --rm agent-a`.
+#  - agent-b-chat — отдельный сервис, запускающий тот же образ agent-b
+#    в режиме REPL-чата (AGENT_B_CHAT=1, без HTTP-порта). Тоже через `run`.
+#
+# Агенты намеренно НЕ связаны жёстко: если agent-b не запущен, agent-a
+# просто стартует в standalone-режиме как обычный чат с LLM (без
+# инструмента check_board). Поэтому ни depends_on, ни service_healthy
+# здесь не нужны.
+
+services:
+  agent-b:
+    build:
+      context: ./agent-b
+    image: new-mcp-server/agent-b:latest
+    container_name: agent-b
+    environment:
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:?set MISTRAL_API_KEY in .env or shell}
+      MISTRAL_MODEL: ${MISTRAL_MODEL:-mistral-small-latest}
+      MISTRAL_BASE_URL: ${MISTRAL_BASE_URL:-https://api.mistral.ai/v1}
+      AGENT_B_LISTEN_ADDR: ":8080"
+      AGENT_B_ENDPOINT_PATH: "/mcp"
+      # AGENT_B_CHAT не выставлен — это «серверный» инстанс.
+    networks:
+      - mcpnet
+    # Порт пробрасываем только для отладки/curl с хоста.
+    # Для связи между контейнерами он не нужен — agent-a ходит к agent-b
+    # по внутреннему DNS-имени docker-сети.
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  agent-a:
+    build:
+      context: ./agent-a
+    image: new-mcp-server/agent-a:latest
+    container_name: agent-a
+    profiles: ["interactive"]
+    environment:
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:?set MISTRAL_API_KEY in .env or shell}
+      MISTRAL_MODEL: ${MISTRAL_MODEL:-mistral-small-latest}
+      MISTRAL_BASE_URL: ${MISTRAL_BASE_URL:-https://api.mistral.ai/v1}
+      AGENT_B_URL: "http://agent-b:8080/mcp"
+    networks:
+      - mcpnet
+    stdin_open: true
+    tty: true
+    restart: "no"
+
+  # Тот же образ, что и agent-b, но запущен в режиме REPL-чата
+  # (без HTTP-сервера снаружи). Нужен только когда хочется поговорить
+  # с «персонажем-чекером» напрямую, не через agent-a.
+  agent-b-chat:
+    image: new-mcp-server/agent-b:latest
+    build:
+      context: ./agent-b
+    container_name: agent-b-chat
+    profiles: ["interactive"]
+    environment:
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:?set MISTRAL_API_KEY in .env or shell}
+      MISTRAL_MODEL: ${MISTRAL_MODEL:-mistral-small-latest}
+      MISTRAL_BASE_URL: ${MISTRAL_BASE_URL:-https://api.mistral.ai/v1}
+      AGENT_B_CHAT: "1"
+      # Слушаем на нестандартном порту, чтобы не конфликтовать с
+      # основным фоновым agent-b. Порт наружу не пробрасываем.
+      AGENT_B_LISTEN_ADDR: ":18080"
+    networks:
+      - mcpnet
+    stdin_open: true
+    tty: true
+    restart: "no"
+    # HEALTHCHECK в Dockerfile прибит к порту 8080. В этом сервисе мы слушаем
+    # 18080, поэтому baked-in healthcheck тут всегда был бы unhealthy.
+    # Нам он и не нужен: на agent-b-chat никто не завязывается через depends_on.
+    healthcheck:
+      disable: true
+
+networks:
+  mcpnet:
+    driver: bridge
