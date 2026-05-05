@@ -17,7 +17,6 @@ import (
 // connectMCP устанавливает MCP-соединение с агентом по заданному URL.
 // Делает до 10 попыток с паузой — сглаживает race при запуске контейнеров.
 func connectMCP(ctx context.Context, url, name string) (*client.Client, error) {
-	log.Printf("[clients] connecting to %s at %s", name, url)
 	c, err := client.NewStreamableHttpClient(url)
 	if err != nil {
 		return nil, fmt.Errorf("new client %s: %w", name, err)
@@ -31,7 +30,6 @@ func connectMCP(ctx context.Context, url, name string) (*client.Client, error) {
 		startErr := c.Start(startCtx)
 		cancel()
 		if startErr != nil {
-			log.Printf("[clients] %s start attempt %d/10: %v", name, attempt, startErr)
 			time.Sleep(800 * time.Millisecond)
 			continue
 		}
@@ -39,14 +37,13 @@ func connectMCP(ctx context.Context, url, name string) (*client.Client, error) {
 		req := mcp.InitializeRequest{}
 		req.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 		req.Params.ClientInfo = mcp.Implementation{Name: "mcp-server", Version: "2.0.0"}
-		res, initErr := c.Initialize(initCtx, req)
+		_, initErr := c.Initialize(initCtx, req)
 		cancel()
 		if initErr != nil {
-			log.Printf("[clients] %s init attempt %d/10: %v", name, attempt, initErr)
 			time.Sleep(800 * time.Millisecond)
 			continue
 		}
-		log.Printf("[clients] connected to %s (%s v%s)", name, res.ServerInfo.Name, res.ServerInfo.Version)
+		log.Printf("mcp ok %s", name)
 		return c, nil
 	}
 	_ = c.Close()

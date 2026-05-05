@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 
 	"github.com/mark3labs/mcp-go/client"
 )
@@ -44,6 +45,7 @@ func (cc *CreatorClient) GenerateNewGame(ctx context.Context, theme string) (*Ne
 	if err != nil {
 		return nil, fmt.Errorf("generate_new_game: %w", err)
 	}
+	log.Printf("CREATOR %s", raw)
 	var result NewGameResult
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
 		return nil, fmt.Errorf("decode NewGameResult: %w (raw=%s)", err, raw)

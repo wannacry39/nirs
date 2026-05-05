@@ -2,24 +2,17 @@ name: puzzle-agents
 
 # Архитектура (каждый компонент в отдельном контейнере):
 #
-#   creator    — HTTP-агент (AGENT_ROLE=CREATOR), порт 9001.
-#                POST /create_game → LLM генерирует доску + напутствие.
-#                Никакого MCP-кода.
+#   creator    — MCP-сервер (AGENT_ROLE=CREATOR), :9001/mcp.
+#                Инструмент generate_new_game (LLM).
 #
-#   checker    — HTTP-агент (AGENT_ROLE=CHECKER), порт 9002.
-#                POST /check_finished → LLM проверяет завершённость.
-#                POST /check_move     → LLM валидирует ход + возвращает новое поле.
-#                Никакого MCP-кода.
+#   checker    — MCP-сервер (AGENT_ROLE=CHECKER), :9002/mcp.
+#                Инструменты is_finished, check_is_valid (LLM).
 #
-#   mcp-server — единственный компонент с MCP-кодом.
-#                Хранит состояние доски в памяти.
-#                Принимает MCP-запросы от player (порт 9000, /mcp).
-#                Принимает REST-запросы от player (порт 9000, /api/*).
-#                Роутит к creator и checker через обычный HTTP.
+#   mcp-server — роутер + хранилище доски. MCP на :9000/mcp.
+#                Клиенты к creator/checker (пакет clients). /healthz
 #
-#   player     — интерактивный REPL (AGENT_ROLE=PLAYER).
-#                LLM принимает решения: какой инструмент вызвать, какую фишку двигать.
-#                Вызывает REST API mcp-server (/api/*) через net/http — без MCP-кода.
+#   player     — REPL (AGENT_ROLE=PLAYER). MCP-клиент только к mcp-server.
+#                Ручные команды /move, /state, /new, /done (см. README).
 #
 # Порядок запуска:
 #   creator и checker стартуют первыми (healthcheck на /healthz).

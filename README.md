@@ -1,99 +1,82 @@
-# new_mcp_server — два LLM-чат-агента поверх MCP
+# new_mcp_server — «пятнашки» через MCP и несколько LLM-агентов
 
-Учебный проект на Go: два независимых сервиса в Docker-контейнерах,
-каждый из которых — обычный чат с LLM. Между собой они общаются
-по [Model Context Protocol](https://modelcontextprotocol.io/) (MCP)
-через **штатный транспорт Streamable HTTP** (часть базовой спецификации
-MCP, не самописный REST).
+Учебный проект на Go: игра «пятнашки» (15-puzzle), в которой несколько
+контейнеров общаются по [Model Context Protocol](https://modelcontextprotocol.io/)
+(MCP) через **штатный транспорт Streamable HTTP** ([спецификация MCP](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)),
+без самописного REST между компонентами.
 
-- **agent-a** — чат, у которого опционально подключён MCP-инструмент
-  `check_board`. Если `agent-b` доступен — попроси проверить поле
-  «пятнашек», и он сходит к `agent-b` по MCP, получит вердикт и
-  пересскажет пользователю. Если `agent-b` лежит — `agent-a` просто
-  работает как обычный чат с LLM, без инструментов.
-- **agent-b** — чат + MCP-сервер с инструментом `check_board`.
-  С пользователем общается напрямую как обычная LLM, а инструмент
-  отвечает на запросы от `agent-a`.
+Центральный **mcp-server** держит состояние доски в памяти и выступает
+роутером: игрок вызывает один MCP-эндпоинт, сервер сам делегирует запросы
+агентам **CREATOR** (генерация новой игры) и **CHECKER** (проверка
+завершённости и валидность хода). Решение «что вызывать» для текстового
+диалога принимает LLM в роли **PLAYER** через обычный tool-calling (список
+инструментов приходит с роутера через `tools/list`). Дополнительно пользователь
+может отдавать ходы **напрямую** командами вида `/move 5`, минуя рассуждения LLM.
 
-Агенты намеренно НЕ связаны жёстко: каждый стартует независимо,
-работоспособность одного не зависит от другого.
-
-Никаких системных промптов: оба чата — это «голый» pass-through
-к модели (что написал пользователь, то и улетело в LLM, обратно
-вернулся ответ). Поведение агента А с инструментом обеспечивается
-не системным промптом, а штатным механизмом tool-calling: модель
-сама читает описание `check_board` (полученное от MCP-сервера через
-`tools/list`) и решает, нужно ли его вызвать.
+Игровая логика в коде намеренно сведена к минимуму: генерация поля,
+проверка хода и «решено ли поле» формулируются в промптах к LLM у CREATOR
+и CHECKER; роутер только хранит строку состояния и записывает её после
+успешных операций.
 
 ---
 
 ## 1. Архитектура
 
 ```
-                 ┌──────────────────────────────┐
-                 │           agent-a            │
-                 │  (контейнер, чат-REPL)       │
-                 │                              │
-                 │  голый чат с LLM (Mistral)   │
-                 │  tools: [check_board]        │
-                 │  MCP-клиент (Streamable HTTP)│
-                 └────────────┬─────────────────┘
-                              │
-                              │  MCP / JSON-RPC
-                              │  поверх HTTP (POST /mcp + SSE)
-                              │  → стандартный транспорт MCP,
-                              │    не самописный REST-API
-                              ▼
-                 ┌──────────────────────────────┐
-                 │           agent-b            │
-                 │  (контейнер)                 │
-                 │                              │
-                 │  • MCP-сервер на :8080/mcp   │
-                 │      инструмент check_board  │
-                 │      (Streamable HTTP)       │
-                 │  • опционально: чат-REPL     │
-                 │      (AGENT_B_CHAT=1)        │
-                 └──────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│  PLAYER (контейнер, AGENT_ROLE=PLAYER)                                   │
+│  REPL + LLM (Mistral через OpenAI-совместимый API)                       │
+│  MCP-клиент → только http://mcp-server:9000/mcp                         │
+│  tools/list → get_state | new_game | is_finished | move                  │
+└───────────────────────────────┬─────────────────────────────────────────┘
+                                │  MCP Streamable HTTP  (/mcp)
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  mcp-server (:9000)                                                      │
+│  • хранилище текущей доски (строка из 16 токенов)                       │
+│  • MCP-сервер для игрока                                                 │
+│  • пакет clients: MCP-клиенты к CREATOR и CHECKER                       │
+└───────┬─────────────────────────────────────────────┬─────────────────┘
+        │ MCP /tools/call                               │ MCP /tools/call
+        ▼                                                 ▼
+┌───────────────────────┐                     ┌───────────────────────────┐
+│ CREATOR (:9001/mcp)   │                     │ CHECKER (:9002/mcp)       │
+│ AGENT_ROLE=CREATOR    │                     │ AGENT_ROLE=CHECKER      │
+│ инструмент:           │                     │ инструменты:             │
+│ generate_new_game     │                     │ is_finished              │
+│ (LLM → доска+текст)   │                     │ check_is_valid           │
+└───────────────────────┘                     └───────────────────────────┘
 ```
 
 Что важно:
 
-- `agent-b` поднимает `server.NewStreamableHTTPServer` из
-  [`mcp-go`](https://github.com/mark3labs/mcp-go) и слушает порт `:8080`,
-  эндпоинт `/mcp` (это **базовый MCP-транспорт**, см.
-  [спецификацию MCP](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)).
-- `agent-a` подключается к `agent-b` через `client.NewStreamableHttpClient`
-  по URL из переменной окружения `AGENT_B_URL` (по умолчанию
-  `http://localhost:8080/mcp`).
-- Никаких stdio, никаких дочерних процессов, никаких самописных
-  HTTP-эндпоинтов поверх MCP.
+- Транспорт между всеми узлами — **один и тот же**: `Initialize`,
+  `tools/list`, `tools/call` поверх Streamable HTTP (`POST /mcp`, при необходимости SSE),
+  как в [`mcp-go`](https://github.com/mark3labs/mcp-go).
+- **PLAYER** не знает URL CREATOR/CHECKER — только URL роутера.
+- **CREATOR** и **CHECKER** не имеют доступа к хранилищу: они получают
+  аргументы в вызове инструмента (доску передаёт роутер из своего состояния).
 
-### Поток одного сообщения «проверь поле»
+### Поток «новая игра»
 
-1. Пользователь в чате `agent-a` пишет: *«сгенерируй поле и проверь, выигрышное ли оно»*.
-2. `agent-a` отправляет это сообщение в Mistral вместе со списком доступных
-   `tools` (туда был автоматически конвертирован `check_board` из
-   `tools/list` MCP-сервера `agent-b`).
-3. LLM отвечает с `tool_calls`: `check_board(board="...")`.
-4. `agent-a` пересылает вызов в MCP-сервер `agent-b` по HTTP
-   (`POST /mcp`, JSON-RPC `tools/call`).
-5. Хендлер `check_board` в `agent-b` делает свой запрос к Mistral
-   (с инструкцией прямо в user-сообщении и `response_format=json_object`),
-   получает `{"solved": bool, "reason": "..."}` и отдаёт это обратно
-   как MCP-результат инструмента.
-6. Результат возвращается в LLM `agent-a` как сообщение с ролью `tool`.
-7. LLM формирует обычный человеческий ответ для пользователя.
+1. Игрок (или LLM по запросу пользователя) вызывает инструмент `new_game`.
+2. Роутер вызывает у CREATOR MCP-инструмент `generate_new_game`.
+3. Ответ парсится (ожидается JSON с полями `board`, `message`), новая доска
+   записывается в память роутера.
+4. Результат возвращается игроку как текст MCP-результата.
 
-Если пользователь просто болтает («привет», «как дела», «что за пятнашки?») —
-никакой `check_board` не вызывается: модель сама определяет, нужен ли
-инструмент в текущем шаге.
+### Поток «ход»
 
-### Поток обычного сообщения в `agent-b` чате
+1. Вызывается `move` с номером фишки `tile`.
+2. Роутер передаёт в CHECKER текущую доску и `tile` через `check_is_valid`.
+3. При успешной валидации (по мнению LLM в CHECKER) роутер сохраняет новую
+   доску; ответ уходит игроку.
 
-1. Пользователь пишет в REPL `agent-b` любое сообщение.
-2. `agent-b` отправляет это сообщение (плюс прежнюю историю диалога,
-   без какого-либо системного промпта) в Mistral.
-3. Получает ответ модели и печатает его в stdout.
+### Ручные команды в REPL PLAYER
+
+Строки вида `/move 12`, `/state`, `/new тема`, `/done` обрабатываются до
+отправки в LLM: выполняется тот же MCP `tools/call` к роутеру, без лишнего
+раунда модели. Подсказка при старте и команда `/?` выводят краткий список.
 
 ---
 
@@ -102,66 +85,72 @@ MCP, не самописный REST).
 ```
 new_mcp_server/
 ├── agent-a/
-│   ├── main.go         # MCP-клиент (Streamable HTTP) + chat REPL с tool-calling
+│   ├── main.go          # один бинарь: PLAYER | CREATOR | CHECKER (AGENT_ROLE)
 │   ├── go.mod
 │   ├── go.sum
 │   ├── Dockerfile
 │   └── .dockerignore
-├── agent-b/
-│   ├── main.go         # MCP-сервер (Streamable HTTP) + опциональный chat REPL
+├── mcp-server/
+│   ├── main.go          # роутер + хранилище + HTTP /mcp и /healthz
+│   ├── clients/
+│   │   ├── mcp.go       # connectMCP, callTool
+│   │   ├── creator.go   # CreatorClient → generate_new_game
+│   │   └── checker.go   # CheckerClient → is_finished, check_is_valid
 │   ├── go.mod
 │   ├── go.sum
 │   ├── Dockerfile
 │   └── .dockerignore
-├── docker-compose.yml  # agent-b (фон) + agent-a / agent-b-chat (interactive)
-├── .env.example        # шаблон переменных окружения
+├── docker-compose.yml   # creator, checker, mcp-server (фон) + player (run)
+├── .env.example
 └── README.md
 ```
 
-Каждый агент — самостоятельный Go-модуль с собственным `go.mod`.
+Два Go-модуля: `agent-a` и `mcp-server`.
 
 ### Зависимости
 
 - [`github.com/mark3labs/mcp-go`](https://github.com/mark3labs/mcp-go) `v0.49.0`
-  — реализация MCP-клиента и сервера на Go (включая Streamable HTTP transport).
-- [`github.com/sashabaranov/go-openai`](https://github.com/sashabaranov/go-openai) `v1.41.2`
-  — OpenAI-совместимый клиент, через который мы ходим в Mistral.
+  — MCP-сервер и клиент (Streamable HTTP).
+- [`github.com/sashabaranov/go-openai`](https://github.com/sashabaranov/go-openai)
+  — OpenAI-совместимый клиент для Mistral и других провайдеров.
 
-Go: `1.25` (для локальной сборки), либо `golang:1.25-alpine` в Docker
-(см. `Dockerfile`-ы).
+Go: **1.25.x** (локально и в `Dockerfile` как `golang:1.25-alpine`).
 
 ---
 
-## 3. Что делает каждый агент
+## 3. Что делает каждый компонент
 
-### agent-a (`agent-a/main.go`) — chat + MCP-клиент
+### `mcp-server` (`mcp-server/main.go`)
 
-- На старте: подключается к `agent-b` (Streamable HTTP), делает
-  `Initialize`, тянет `tools/list` и конвертирует MCP-инструменты
-  в формат `openai.Tool` для chat completion.
-- Запускает REPL: читает stdin, добавляет ввод в историю как `user`,
-  гоняет цикл «модель → возможные `tool_calls` → MCP → модель»,
-  печатает финальный ответ в stdout.
-- Системного промпта нет. Решение «вызывать ли `check_board`» модель
-  принимает сама на основе описания инструмента, которое пришло
-  из MCP-сервера.
-- Команды: `/reset` — очистить историю, `/exit` или Ctrl+D — выход.
+- Поднимает `server.NewStreamableHTTPServer` на `LISTEN_ADDR` (по умолчанию
+  `:9000`), путь `ENDPOINT_PATH` (`/mcp`).
+- При старте подключается к CREATOR и CHECKER через пакет `clients`
+  (ретраи на время подъёма контейнеров).
+- Инструменты **для игрока**: `get_state`, `new_game`, `is_finished`, `move`.
+- Делегирование: `new_game` → `CreatorClient.GenerateNewGame`;
+  `is_finished` / `move` → `CheckerClient.IsFinished` / `CheckIsValid`.
+- `/healthz` — для Docker healthcheck.
 
-### agent-b (`agent-b/main.go`) — MCP-сервер + (опционально) chat
+### `agent-a` с `AGENT_ROLE=CREATOR`
 
-- Поднимает MCP-сервер `puzzle-checker` v1.0.0 на транспорте
-  Streamable HTTP (`server.NewStreamableHTTPServer`).
-- Слушает `AGENT_B_LISTEN_ADDR` (по умолчанию `:8080`), эндпоинт
-  `AGENT_B_ENDPOINT_PATH` (по умолчанию `/mcp`).
-- Регистрирует один инструмент `check_board(board: string)`.
-- Внутри `check_board`: запрос к Mistral с инструкцией прямо в
-  user-сообщении (без системного промпта) и `response_format=json_object`.
-  Парсит `{"solved": bool, "reason": string}` и возвращает как MCP-результат.
-- Если задан `AGENT_B_CHAT=1`, **дополнительно** запускается REPL-чат
-  на stdin/stdout — тоже без системного промпта, плоский pass-through
-  к модели. MCP-сервер в этот момент крутится в фоне.
-- Отдаёт `/healthz` для healthcheck'а Docker / k8s.
-- Корректно завершается по `SIGINT`/`SIGTERM` (graceful shutdown).
+- MCP-сервер на `LISTEN_ADDR` / `ENDPOINT_PATH` (в compose: `:9001`, `/mcp`).
+- Один инструмент: `generate_new_game` — ответ LLM в формате JSON
+  (`board`, `message`).
+
+### `agent-a` с `AGENT_ROLE=CHECKER`
+
+- MCP-сервер (в compose: `:9002`, `/mcp`).
+- Инструменты: `is_finished`, `check_is_valid` — ответы LLM в JSON.
+
+### `agent-a` с `AGENT_ROLE=PLAYER`
+
+- Подключение к `GAME_SERVER_URL` (роутер MCP).
+- `ListTools` → конвертация в `openai.Tool` → цикл chat completion с
+  `tool_calls` → `CallTool` на роутер.
+- Команды REPL: `/reset`, `/exit`, плюс ручные команды (см. выше).
+- Для Mistral: у сообщений с `tool_calls` при необходимости выставляется
+  `Type: "function"`, иначе возможна ошибка 422 (как в классическом
+  fix для пустого `tool_calls[].type`).
 
 ---
 
@@ -169,156 +158,152 @@ Go: `1.25` (для локальной сборки), либо `golang:1.25-alpin
 
 ### 4.1. Переменные окружения
 
-Общие (нужны в обоих контейнерах):
+Общие для всех сервисов с LLM:
 
 | Переменная | Default | Назначение |
 |---|---|---|
-| `MISTRAL_API_KEY` (или `OPENAI_API_KEY` как fallback) | — | API-ключ Mistral. Обязателен. |
-| `MISTRAL_MODEL` (или `OPENAI_MODEL`) | `mistral-small-latest` | Имя модели. |
-| `MISTRAL_BASE_URL` (или `OPENAI_BASE_URL`) | `https://api.mistral.ai/v1` | Базовый URL API. |
+| `MISTRAL_API_KEY` или `OPENAI_API_KEY` | — | Ключ API. Обязателен. |
+| `MISTRAL_MODEL` или `OPENAI_MODEL` | `mistral-small-latest` | Модель. |
+| `MISTRAL_BASE_URL` или `OPENAI_BASE_URL` | `https://api.mistral.ai/v1` | Базовый URL. |
 
-Только для `agent-a`:
-
-| Переменная | Default | Назначение |
-|---|---|---|
-| `AGENT_B_URL` | `http://localhost:8080/mcp` | URL MCP-эндпоинта `agent-b`. В docker-compose выставляется в `http://agent-b:8080/mcp`. |
-
-Только для `agent-b`:
+**mcp-server:**
 
 | Переменная | Default | Назначение |
 |---|---|---|
-| `AGENT_B_LISTEN_ADDR` | `:8080` | Адрес HTTP-листенера. |
-| `AGENT_B_ENDPOINT_PATH` | `/mcp` | Путь MCP-эндпоинта. |
-| `AGENT_B_CHAT` | (не задан) | Если `1` — запустить REPL-чат на stdin вместе с MCP-сервером. |
+| `LISTEN_ADDR` | `:9000` | HTTP. |
+| `ENDPOINT_PATH` | `/mcp` | Путь MCP. |
+| `CREATOR_URL` | `http://creator:9001/mcp` | MCP CREATOR. |
+| `CHECKER_URL` | `http://checker:9002/mcp` | MCP CHECKER. |
 
-### 4.2. Запуск через Docker Compose (рекомендуется)
+**creator / checker** (образ `agent-a`):
 
-Перед стартом:
+| Переменная | Назначение |
+|---|---|
+| `AGENT_ROLE` | `CREATOR` или `CHECKER` |
+| `LISTEN_ADDR` | `:9001` / `:9002` |
+| `ENDPOINT_PATH` | `/mcp` |
+
+**player:**
+
+| Переменная | Default | Назначение |
+|---|---|---|
+| `AGENT_ROLE` | — | `PLAYER` |
+| `GAME_SERVER_URL` | — | `http://mcp-server:9000/mcp` в compose |
+
+### 4.2. Docker Compose
 
 ```bash
 cp .env.example .env
-# отредактируй .env: MISTRAL_API_KEY=...
+# прописать MISTRAL_API_KEY
 ```
 
-Поднимаем фоновый MCP-сервер `agent-b`:
+Фоновые сервисы (creator и checker должны стать healthy до старта роутера):
 
 ```bash
-docker compose up -d agent-b
+docker compose up -d --build creator checker mcp-server
 ```
 
-Чтобы пообщаться с `agent-a` (тут можно просить «придумай поле и проверь его»):
+Интерактивный игрок:
 
 ```bash
-docker compose run --rm agent-a
+docker compose run --rm player
 ```
 
-Чтобы пообщаться с `agent-b` напрямую (отдельный контейнер с тем же
-образом, в режиме REPL-чата):
+Остановка: `docker compose down`.
 
-```bash
-docker compose run --rm agent-b-chat
-```
+Порты на хосте (для отладки): `9000` — роутер, `9001` — CREATOR, `9002` — CHECKER.
 
-Можно запустить оба чата одновременно — в разных терминалах. Между
-собой `agent-a` и фоновый `agent-b` общаются по docker-сети `mcpnet`
-(имя `agent-b` резолвится во внутренний IP).
+### 4.3. Локальный запуск (без Docker)
 
-Остановить всё: `docker compose down`.
+Нужны четыре процесса и ключ API. Примеры для PowerShell:
 
-> Порт `8080:8080` пробрасывается на хост только для отладки. Для связи
-> между контейнерами он не нужен — `agent-a` ходит по
-> `http://agent-b:8080/mcp` через внутренний docker DNS.
-
-### 4.3. Локальный запуск без Docker
-
-В разных терминалах.
-
-**Terminal 1 — фоновый MCP-сервер `agent-b`** (Windows / PowerShell):
+**CREATOR** — из каталога `mcp-server` не нужен; только `agent-a`:
 
 ```powershell
-$env:MISTRAL_API_KEY     = "<твой_ключ>"
-$env:AGENT_B_LISTEN_ADDR = ":8080"
-
-cd E:\vscode\new_mcp_server\agent-b
-go run .
+$env:MISTRAL_API_KEY="..."
+$env:AGENT_ROLE="CREATOR"
+$env:LISTEN_ADDR=":9001"
+cd agent-a; go run .
 ```
 
-**Terminal 2 — чат с `agent-a`**:
+**CHECKER** — второй терминал:
 
 ```powershell
-$env:MISTRAL_API_KEY = "<твой_ключ>"
-$env:AGENT_B_URL     = "http://localhost:8080/mcp"
-
-cd E:\vscode\new_mcp_server\agent-a
-go run .
+$env:AGENT_ROLE="CHECKER"
+$env:LISTEN_ADDR=":9002"
+cd agent-a; go run .
 ```
 
-**(опционально) Terminal 3 — чат с `agent-b` напрямую**:
+**Роутер** — третий терминал, каталог `mcp-server`:
 
 ```powershell
-$env:MISTRAL_API_KEY     = "<твой_ключ>"
-$env:AGENT_B_CHAT        = "1"
-$env:AGENT_B_LISTEN_ADDR = ":18080"   # чтобы не конфликтовать с Terminal 1
-
-cd E:\vscode\new_mcp_server\agent-b
-go run .
+$env:CREATOR_URL="http://127.0.0.1:9001/mcp"
+$env:CHECKER_URL="http://127.0.0.1:9002/mcp"
+cd mcp-server; go run .
 ```
 
-Аналогично для Linux/macOS, заменив `$env:NAME = "..."` на `export NAME=...`.
-
-### 4.4. Сборка бинарников вручную
+**PLAYER** — четвёртый:
 
 ```powershell
-cd E:\vscode\new_mcp_server\agent-b
-go build -o agent-b.exe .
+$env:MISTRAL_API_KEY="..."
+$env:AGENT_ROLE="PLAYER"
+$env:GAME_SERVER_URL="http://127.0.0.1:9000/mcp"
+cd agent-a; go run .
+```
 
-cd E:\vscode\new_mcp_server\agent-a
-go build -o agent-a.exe .
+### 4.4. Сборка бинарников
+
+```powershell
+cd mcp-server
+go build -o mcp-server.exe .
+
+cd ..\agent-a
+go build -o agent.exe .
 ```
 
 ---
 
-## 5. Пример сессии
-
-В `agent-a`-чате:
+## 5. Пример сессии (PLAYER)
 
 ```
-agent-a: чат готов. Просто пиши, что хочешь.
-         (если попросишь проверить поле «пятнашек» — схожу к agent-b по MCP)
-         /reset — очистить историю, /exit или Ctrl+D — выйти.
+PLAYER готов. /move /state /new /done /? · /reset /exit
 
-you> привет, кто ты?
-agent-a> Привет! Я ассистент с подключённым инструментом для проверки полей «пятнашек». Спрашивай.
+you> /state
+board {"board":"1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 _"}
 
-you> сгенерируй поле и проверь, решено ли оно
-agent-a> Сгенерировал поле: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 _.
-         Проверка через check_board подтвердила: solved=true — поле уже в решённом виде.
+you> /new
+CREATOR {"board":"…","message":"…"}
 
-you> /exit
+you> /move 5
+CHECKER {"valid":true,"board":"…","reason":"…"}
+
+you> сделай ещё один ход если можешь
+PLAYER> …
 ```
 
-В этот момент в `agent-b` (фон) в stderr будет:
-
-```
-[agent-b] check_board called: board="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 _"
-[agent-b] check_board verdict: solved=true reason="Поле полностью соответствует решённому виду."
-```
-
-В отдельном `agent-b`-чате:
-
-```
-agent-b: чат готов. Просто пиши, что хочешь.
-         /reset — очистить историю, /exit или Ctrl+D — выйти.
-
-you> что такое «пятнашки»?
-agent-b> Это головоломка 4×4: пятнадцать фишек 1..15 и одна пустая клетка...
-```
+В логах контейнеров (`docker compose logs`) префиксы вроде `CREATOR …`,
+`CHECKER …` показывают, какой агент сформировал ответ на шаге делегирования.
 
 ---
 
-## 6. История изменений в проекте
+## 6. Ограничения и идеи
 
-Хронология ключевых правок, сделанных по ходу работы.
+- Ответы LLM должны оставаться **валидным JSON** там, где клиент роутера
+  делает `json.Unmarshal` — при «сломанном» ответе делегирование упадёт
+  с ошибкой декодирования.
+- Число `tile` в протоколе чаще всего приходит как `float64`; при экзотическом
+  типе из другого клиента может понадобиться нормализация в роутере.
+- История диалога PLAYER не сохраняется между перезапусками контейнера.
+- Для продакшена к `/mcp` имеет смысл добавить TLS и аутентификацию
+  (например reverse-proxy с Bearer), как и для любого HTTP-сервиса.
+
+---
+
+## 7. История изменений в проекте
+
+Хронология ключевых правок по ходу работы. Поряд шагов 1–7 отражает
+эволюцию **первой** учебной схемы (два агента, `check_board`); шаг 8 —
+переход к **текущей** схеме с роутером и отдельными CREATOR/CHECKER.
 
 ### Шаг 1. Базовая (учебная) версия двух агентов поверх stdio
 
@@ -490,27 +475,30 @@ completion.
 рабочий чат с LLM (без инструментов). Если `agent-b` поднять позже —
 новый запуск `agent-a` снова обнаружит `check_board` и подключит его.
 
----
+### Шаг 8. Текущая архитектура: роутер состояния и три роли в agent-a
 
-## 7. Ограничения и идеи на будущее
+После шагов 1–7 код эволюционировал в отдельную постановку задачи:
 
-- Системных промптов нет — поведение модели целиком зависит от
-  описания MCP-инструментов и здравомыслия LLM. Если модель почему-то
-  начнёт игнорировать `check_board` — проще не возвращать промпт, а
-  улучшить `description` инструмента в `agent-b`.
-- Сейчас MCP-сервер `agent-b` имеет только один инструмент. Можно
-  добавить, например, `solve_board` или `score_board` и научить агента
-  пользоваться несколькими инструментами в одном диалоге.
-- Сейчас `agent-b` слушает голый HTTP. Для прод-сценария стоит добавить
-  TLS (либо терминирование на reverse-proxy типа nginx/Traefik, либо
-  через `WithTLSCert` опцию `mcp-go`) и аутентификацию (например,
-  Bearer-токен через middleware на `/mcp`).
-- В чатах нет персистентности истории: после `docker compose down`
-  диалог исчезает. Для учебного проекта это норма; для прода стоило
-  бы вынести `messages` в стораж (sqlite/redis) и восстанавливать
-  по идентификатору сессии.
-- `agent-a` определяет доступность `agent-b` только при старте.
-  Если `agent-b` поднять уже после старта `agent-a`, чат продолжит
-  работать как plain (без `check_board`). Можно добавить либо
-  команду `/reconnect`, либо фоновый retry с переоткрытием MCP-клиента,
-  если он лёг во время сессии.
+- Введён **`mcp-server`**: хранит строку доски в памяти, поднимает
+  публичный MCP для **PLAYER** (`get_state`, `new_game`, `is_finished`,
+  `move`). Делегирование к специализированным агентам вынесено в пакет
+  **`mcp-server/clients`** (`CreatorClient`, `CheckerClient`) — поверх тех же
+  MCP-вызовов к другим HTTP-эндпоинтам.
+- **`agent-b`** как отдельный модуль удалён; один репозиторий **`agent-a`**
+  собирается с `AGENT_ROLE=CREATOR | CHECKER | PLAYER`.
+- **CREATOR** и **CHECKER** — полноценные MCP-серверы на своих портах;
+  инструменты `generate_new_game`, `is_finished`, `check_is_valid`; игровая
+  логика в промптах к LLM по заданию учебного проекта.
+- **PLAYER** подключается только к роутеру, получает `tools/list` с него,
+  при необходимости исправляет пустой `type` у tool calls (наследие Шага 3).
+- Добавлены **ручные команды** в REPL (`/move`, `/state`, `/new`, `/done`, …)
+  без лишнего раунда LLM.
+- **Docker Compose**: сервисы `creator`, `checker`, `mcp-server`, профиль
+  `interactive` для `player`; `depends_on` с `service_healthy` для корректного
+  порядка старта.
+- Документация и комментарии в compose приведены в соответствие с MCP-между
+  всеми сервисами (без устаревших отсылок к «чистому HTTP» между агентами).
+
+Исторические имена **`agent-b`**, **`check_board`**, порт **`:8080`** относятся
+к шагам 1–7; в актуальном коде их заменяют сервисы **creator/checker** и
+перечисленные выше инструменты.

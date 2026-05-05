@@ -79,15 +79,11 @@ func buildMCPServer(st *store, creator *clients.CreatorClient, checker *clients.
 	// get_state — локально, без делегирования.
 	s.AddTool(
 		mcp.NewTool("get_state",
-			mcp.WithDescription(
-				"Возвращает текущее состояние поля «пятнашки». "+
-					"Строка из 16 токенов через пробел: числа 1-15 и «_» (пустая клетка), "+
-					"слева направо, сверху вниз, по 4 в ряд.",
-			),
+			mcp.WithDescription("Текущая доска «пятнашки»: 16 токенов, числа 1–15 и _."),
 		),
 		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			board := st.get()
-			log.Printf("get_state → %q", board)
+			log.Printf("state %q", board)
 			out, _ := json.Marshal(map[string]string{"board": board})
 			return mcp.NewToolResultText(string(out)), nil
 		},
@@ -96,16 +92,8 @@ func buildMCPServer(st *store, creator *clients.CreatorClient, checker *clients.
 	// new_game → CREATOR.generate_new_game
 	s.AddTool(
 		mcp.NewTool("new_game",
-			mcp.WithDescription(
-				"Создаёт новую игру «пятнашки». "+
-					"Делегирует агенту CREATOR (MCP-инструмент generate_new_game): "+
-					"LLM генерирует перемешанную доску и напутствие. "+
-					"Сервер сохраняет новую доску. "+
-					"Возвращает {\"board\": string, \"message\": string}.",
-			),
-			mcp.WithString("theme",
-				mcp.Description("Необязательная тема напутствия (например, «загадочное»)."),
-			),
+			mcp.WithDescription("Новая игра: CREATOR генерирует доску. theme — опционально."),
+			mcp.WithString("theme", mcp.Description("Тема напутствия.")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			argsMap, _ := req.Params.Arguments.(map[string]any)
@@ -113,19 +101,15 @@ func buildMCPServer(st *store, creator *clients.CreatorClient, checker *clients.
 			if argsMap != nil {
 				theme, _ = argsMap["theme"].(string)
 			}
-
-			log.Printf("new_game → CREATOR.generate_new_game (theme=%q)", theme)
 			result, err := creator.GenerateNewGame(ctx, theme)
 			if err != nil {
 				return mcp.NewToolResultErrorFromErr("CREATOR", err), nil
 			}
-
 			if result.Board != "" {
 				st.set(result.Board)
-				log.Printf("new_game: stored board %q", result.Board)
 			}
-
 			out, _ := json.Marshal(result)
+			log.Printf("CREATOR generate_new_game %s", string(out))
 			return mcp.NewToolResultText(string(out)), nil
 		},
 	)
@@ -133,24 +117,16 @@ func buildMCPServer(st *store, creator *clients.CreatorClient, checker *clients.
 	// is_finished → CHECKER.is_finished
 	s.AddTool(
 		mcp.NewTool("is_finished",
-			mcp.WithDescription(
-				"Проверяет, решена ли текущая игра. "+
-					"Делегирует агенту CHECKER (MCP-инструмент is_finished): "+
-					"LLM сравнивает доску с решённым состоянием. "+
-					"Возвращает {\"finished\": bool, \"reason\": string}.",
-			),
+			mcp.WithDescription("Решена ли игра: CHECKER сравнивает доску с эталоном."),
 		),
 		func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			board := st.get()
-			log.Printf("is_finished → CHECKER.is_finished (board=%q)", board)
-
 			result, err := checker.IsFinished(ctx, board)
 			if err != nil {
 				return mcp.NewToolResultErrorFromErr("CHECKER", err), nil
 			}
-
-			log.Printf("is_finished ← finished=%v reason=%q", result.Finished, result.Reason)
 			out, _ := json.Marshal(result)
+			log.Printf("CHECKER is_finished %s", string(out))
 			return mcp.NewToolResultText(string(out)), nil
 		},
 	)
@@ -158,17 +134,8 @@ func buildMCPServer(st *store, creator *clients.CreatorClient, checker *clients.
 	// move → CHECKER.check_is_valid
 	s.AddTool(
 		mcp.NewTool("move",
-			mcp.WithDescription(
-				"Пытается переместить фишку. "+
-					"Делегирует агенту CHECKER (MCP-инструмент check_is_valid): "+
-					"LLM проверяет соседство фишки с пустой клеткой. "+
-					"Если ход валиден — сервер сохраняет новую доску. "+
-					"Возвращает {\"valid\": bool, \"board\": string, \"reason\": string}.",
-			),
-			mcp.WithNumber("tile",
-				mcp.Required(),
-				mcp.Description("Номер фишки (1-15), которую нужно переместить."),
-			),
+			mcp.WithDescription("Ход: CHECKER валидирует; при успехе сервер сохраняет доску."),
+			mcp.WithNumber("tile", mcp.Required(), mcp.Description("Фишка 1–15.")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			argsMap, _ := req.Params.Arguments.(map[string]any)
@@ -183,20 +150,15 @@ func buildMCPServer(st *store, creator *clients.CreatorClient, checker *clients.
 			}
 
 			board := st.get()
-			log.Printf("move tile=%.0f → CHECKER.check_is_valid (board=%q)", tileF, board)
-
 			result, err := checker.CheckIsValid(ctx, board, tileF)
 			if err != nil {
 				return mcp.NewToolResultErrorFromErr("CHECKER", err), nil
 			}
-
 			if result.Valid && result.Board != "" && result.Board != board {
 				st.set(result.Board)
-				log.Printf("move: stored new board %q", result.Board)
 			}
-
-			log.Printf("move ← valid=%v reason=%q", result.Valid, result.Reason)
 			out, _ := json.Marshal(result)
+			log.Printf("CHECKER check_is_valid %s", string(out))
 			return mcp.NewToolResultText(string(out)), nil
 		},
 	)

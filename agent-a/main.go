@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -211,7 +212,7 @@ func runCreator(ctx context.Context, llm *openai.Client, model string) {
 			if err != nil {
 				return mcp.NewToolResultErrorFromErr("LLM failed", err), nil
 			}
-			log.Printf("generate_new_game → %s", raw)
+			log.Printf("[CREATOR] %s", raw)
 			return mcp.NewToolResultText(string(raw)), nil
 		},
 	)
@@ -270,7 +271,7 @@ func runChecker(ctx context.Context, llm *openai.Client, model string) {
 			if err != nil {
 				return mcp.NewToolResultErrorFromErr("LLM failed", err), nil
 			}
-			log.Printf("is_finished board=%q → %s", board, raw)
+			log.Printf("[CHECKER] is_finished %s", raw)
 			return mcp.NewToolResultText(string(raw)), nil
 		},
 	)
@@ -327,7 +328,7 @@ func runChecker(ctx context.Context, llm *openai.Client, model string) {
 			if err != nil {
 				return mcp.NewToolResultErrorFromErr("LLM failed", err), nil
 			}
-			log.Printf("check_is_valid tile=%v board=%q → %s", tile, board, raw)
+			log.Printf("[CHECKER] check_is_valid %s", raw)
 			return mcp.NewToolResultText(string(raw)), nil
 		},
 	)
@@ -342,7 +343,6 @@ func runChecker(ctx context.Context, llm *openai.Client, model string) {
 // Вызывает инструменты через MCP — сервер роутит к нужному агенту.
 
 func connectMCP(ctx context.Context, mcpURL, name string) (*client.Client, error) {
-	log.Printf("connecting to MCP at %s", mcpURL)
 	c, err := client.NewStreamableHttpClient(mcpURL)
 	if err != nil {
 		return nil, fmt.Errorf("new client: %w", err)
@@ -356,7 +356,6 @@ func connectMCP(ctx context.Context, mcpURL, name string) (*client.Client, error
 		startErr := c.Start(startCtx)
 		cancel()
 		if startErr != nil {
-			log.Printf("start attempt %d/10: %v", attempt, startErr)
 			time.Sleep(800 * time.Millisecond)
 			continue
 		}
@@ -367,11 +366,10 @@ func connectMCP(ctx context.Context, mcpURL, name string) (*client.Client, error
 		res, initErr := c.Initialize(initCtx, req)
 		cancel()
 		if initErr != nil {
-			log.Printf("init attempt %d/10: %v", attempt, initErr)
 			time.Sleep(800 * time.Millisecond)
 			continue
 		}
-		log.Printf("connected to %q v%s", res.ServerInfo.Name, res.ServerInfo.Version)
+		log.Printf("mcp ok %s %s", mcpURL, res.ServerInfo.Name)
 		return c, nil
 	}
 	_ = c.Close()
@@ -413,7 +411,6 @@ func runPlayer(ctx context.Context, llm *openai.Client, model string) {
 				Parameters:  params,
 			},
 		})
-		log.Printf("tool from server: %s", t.Name)
 	}
 
 	// Все вызовы идут через MCP-клиент к mcp-server.
@@ -441,22 +438,67 @@ func runPlayer(ctx context.Context, llm *openai.Client, model string) {
 		return body, nil
 	}
 
-	systemPrompt := `Ты — агент-игрок в «пятнашки» (15-puzzle, 4×4 поле).
-Цель: привести доску к решённому состоянию:
-  1  2  3  4
-  5  6  7  8
-  9  10 11 12
-  13 14 15  _
+	systemPrompt := `Игра «пятнашки» 4×4, цель: 1…15 и _ внизу справа. Инструменты: get_state, new_game, is_finished, move(tile). Роутер шлёт new_game в CREATOR, остальное проверки — в CHECKER. Если пользователь просит конкретный ход — вызови move.`
 
-Инструменты предоставлены MCP-сервером (он роутит вызовы к агентам):
-• get_state        — посмотреть текущую доску
-• new_game         — создать новую игру (→ агент CREATOR: generate_new_game)
-• is_finished      — проверить завершённость (→ агент CHECKER: is_finished)
-• move(tile)       — переместить фишку (→ агент CHECKER: check_is_valid, сервер сохраняет)
+	runChatREPL(ctx, llm, model, oaiTools, systemPrompt, "PLAYER", dispatch, func(ctx context.Context, line string) bool {
+		return playerTryDirectCommand(ctx, line, dispatch)
+	})
+}
 
-Всегда начинай с get_state. Анализируй доску и делай ходы по одному.`
+func playerTryDirectCommand(ctx context.Context, line string, dispatch toolDispatcher) bool {
+	trimmed := strings.TrimSpace(line)
+	fields := strings.Fields(trimmed)
+	if len(fields) == 0 {
+		return false
+	}
+	cmd := strings.ToLower(strings.TrimPrefix(fields[0], "/"))
 
-	runChatREPL(ctx, llm, model, oaiTools, systemPrompt, "PLAYER", dispatch)
+	out := func(tag string, res string, err error) {
+		if err != nil {
+			fmt.Printf("%s err: %v\n", tag, err)
+		} else {
+			fmt.Printf("%s %s\n", tag, res)
+		}
+	}
+
+	switch cmd {
+	case "help", "h", "?":
+		fmt.Println("без LLM: /move N | /state | /new [тема] | /done | /?  ·  остальное → LLM  ·  /reset /exit")
+		return true
+	case "move", "m", "ход":
+		if len(fields) < 2 {
+			fmt.Println("usage: /move 1..15")
+			return true
+		}
+		n, err := strconv.Atoi(fields[1])
+		if err != nil || n < 1 || n > 15 {
+			fmt.Println("фишка 1..15")
+			return true
+		}
+		log.Printf("player manual → CHECKER move(%d)", n)
+		res, err := dispatch(ctx, "move", map[string]any{"tile": float64(n)})
+		out("CHECKER", res, err)
+		return true
+	case "state", "board", "поле", "s":
+		res, err := dispatch(ctx, "get_state", nil)
+		out("board", res, err)
+		return true
+	case "new", "new_game", "игра":
+		args := map[string]any{}
+		if len(fields) > 1 {
+			args["theme"] = strings.TrimSpace(strings.TrimPrefix(trimmed, fields[0]))
+		}
+		log.Printf("player manual → CREATOR new_game")
+		res, err := dispatch(ctx, "new_game", args)
+		out("CREATOR", res, err)
+		return true
+	case "finished", "check", "done", "win", "решено":
+		log.Printf("player manual → CHECKER is_finished")
+		res, err := dispatch(ctx, "is_finished", nil)
+		out("CHECKER", res, err)
+		return true
+	}
+	return false
 }
 
 // ── REPL ─────────────────────────────────────────────────────────────────────
@@ -471,6 +513,7 @@ func runChatREPL(
 	systemPrompt string,
 	prefix string,
 	dispatch toolDispatcher,
+	lineHook func(ctx context.Context, line string) bool,
 ) {
 	var messages []openai.ChatCompletionMessage
 	if systemPrompt != "" {
@@ -480,8 +523,7 @@ func runChatREPL(
 		})
 	}
 
-	fmt.Printf("%s: чат готов. Пишите сообщения.\n", prefix)
-	fmt.Println("  /reset — очистить историю, /exit — выйти.")
+	fmt.Printf("%s готов. /move /state /new /done /? · /reset /exit\n", prefix)
 
 	reader := bufio.NewReader(os.Stdin)
 	for {
@@ -512,6 +554,10 @@ func runChatREPL(
 		case "/reset":
 			messages = messages[:1]
 			fmt.Printf("%s: история очищена.\n", prefix)
+			continue
+		}
+
+		if lineHook != nil && lineHook(ctx, line) {
 			continue
 		}
 
@@ -575,14 +621,12 @@ func runToolLoop(
 			if args == nil {
 				args = map[string]any{}
 			}
-			log.Printf("→ tool=%s args=%s", tc.Function.Name, tc.Function.Arguments)
-
 			result, err := dispatch(ctx, tc.Function.Name, args)
 			if err != nil {
 				result = fmt.Sprintf(`{"error":%q}`, err.Error())
-				log.Printf("← tool=%s error: %v", tc.Function.Name, err)
+				log.Printf("llm %s err: %v", tc.Function.Name, err)
 			} else {
-				log.Printf("← tool=%s result=%s", tc.Function.Name, result)
+				log.Printf("llm %s %s", tc.Function.Name, result)
 			}
 
 			messages = append(messages, openai.ChatCompletionMessage{

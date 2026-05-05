@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 
 	"github.com/mark3labs/mcp-go/client"
 )
@@ -40,6 +41,7 @@ func (cc *CheckerClient) IsFinished(ctx context.Context, board string) (*IsFinis
 	if err != nil {
 		return nil, fmt.Errorf("is_finished: %w", err)
 	}
+	log.Printf("CHECKER is_finished %s", raw)
 	var result IsFinishedResult
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
 		return nil, fmt.Errorf("decode IsFinishedResult: %w (raw=%s)", err, raw)
@@ -64,6 +66,7 @@ func (cc *CheckerClient) CheckIsValid(ctx context.Context, board string, tile fl
 	if err != nil {
 		return nil, fmt.Errorf("check_is_valid: %w", err)
 	}
+	log.Printf("CHECKER check_is_valid %s", raw)
 	var result CheckMoveResult
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
 		return nil, fmt.Errorf("decode CheckMoveResult: %w (raw=%s)", err, raw)
