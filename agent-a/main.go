@@ -57,6 +57,42 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// formatBoardLine — строка из 16 токенов через пробел → сетка 4×4 для терминала.
+func formatBoardLine(line string) string {
+	toks := strings.Fields(line)
+	if len(toks) != 16 {
+		return line
+	}
+	var b strings.Builder
+	for r := 0; r < 4; r++ {
+		for c := 0; c < 4; c++ {
+			if c > 0 {
+				b.WriteString(" ")
+			}
+			b.WriteString(fmt.Sprintf("%3s", toks[r*4+c]))
+		}
+		if r < 3 {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// formatGetStateResponse — JSON от get_state {"board":"…"} → только читаемая сетка.
+func formatGetStateResponse(body string) string {
+	var m struct {
+		Board string `json:"board"`
+	}
+	if err := json.Unmarshal([]byte(body), &m); err != nil || m.Board == "" {
+		return body
+	}
+	grid := formatBoardLine(m.Board)
+	if grid == m.Board && len(strings.Fields(m.Board)) != 16 {
+		return body
+	}
+	return grid
+}
+
 func newLLMClient(apiKey, baseURL string) *openai.Client {
 	cfg := openai.DefaultConfig(apiKey)
 	cfg.BaseURL = strings.TrimRight(baseURL, "/")
@@ -481,7 +517,11 @@ func playerTryDirectCommand(ctx context.Context, line string, dispatch toolDispa
 		return true
 	case "state", "board", "поле", "s":
 		res, err := dispatch(ctx, "get_state", nil)
-		out("board", res, err)
+		if err != nil {
+			fmt.Printf("board err: %v\n", err)
+			return true
+		}
+		fmt.Printf("board\n%s\n", formatGetStateResponse(res))
 		return true
 	case "new", "new_game", "игра":
 		args := map[string]any{}
