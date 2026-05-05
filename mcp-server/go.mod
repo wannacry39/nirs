@@ -1,11 +1,8 @@
-module agent-b
+module mcp-server
 
 go 1.25.5
 
-require (
-	github.com/mark3labs/mcp-go v0.49.0
-	github.com/sashabaranov/go-openai v1.41.2
-)
+require github.com/mark3labs/mcp-go v0.49.0
 
 require (
 	github.com/google/jsonschema-go v0.4.2 // indirect

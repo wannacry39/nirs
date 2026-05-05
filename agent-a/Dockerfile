@@ -11,14 +11,12 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/agent-a .
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/agent .
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates && adduser -D -u 10001 app
+RUN apk add --no-cache ca-certificates wget && adduser -D -u 10001 app
 USER app
 WORKDIR /app
-COPY --from=build /out/agent-a /app/agent-a
+COPY --from=build /out/agent /app/agent
 
-ENV AGENT_B_URL="http://agent-b:8080/mcp"
-
-ENTRYPOINT ["/app/agent-a"]
+ENTRYPOINT ["/app/agent"]

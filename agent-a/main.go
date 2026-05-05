@@ -1,3 +1,14 @@
+// Универсальный агент для игры «пятнашки».
+//
+//	CREATOR — MCP-сервис (:9001/mcp). Инструмент: generate_new_game.
+//	          LLM генерирует перемешанную доску и напутствие.
+//
+//	CHECKER — MCP-сервис (:9002/mcp). Инструменты: is_finished, check_is_valid.
+//	          LLM проверяет завершённость и валидность хода.
+//
+//	PLAYER  — интерактивный REPL.
+//	          Подключается к mcp-server по MCP, получает tools/list,
+//	          вызывает инструменты — сервер роутит к нужному агенту.
 package main
 
 import (
@@ -8,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -16,23 +28,27 @@ import (
 
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 	openai "github.com/sashabaranov/go-openai"
 )
 
 const (
 	defaultMistralBaseURL = "https://api.mistral.ai/v1"
 	defaultMistralModel   = "mistral-small-latest"
-	defaultAgentBURL      = "http://localhost:8080/mcp"
 )
 
-// Никаких системных промптов: agent-a — это «голый» чат с моделью.
-// Решение, нужно ли вызывать check_board, модель принимает сама на основе
-// описания инструмента (поля Name/Description/Parameters), которое пришло
-// из MCP-сервера через tools/list. Это штатный механизм tool-calling
-// в OpenAI/Mistral API: системный промпт для этого не нужен.
+type Role string
 
-func firstNonEmpty(values ...string) string {
-	for _, v := range values {
+const (
+	RolePlayer  Role = "PLAYER"
+	RoleCreator Role = "CREATOR"
+	RoleChecker Role = "CHECKER"
+)
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
 		if v != "" {
 			return v
 		}
@@ -40,124 +56,353 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func newLLMClient(apiKey, baseURL string) *openai.Client {
+	cfg := openai.DefaultConfig(apiKey)
+	cfg.BaseURL = strings.TrimRight(baseURL, "/")
+	return openai.NewClientWithConfig(cfg)
+}
+
+// askLLMJSON — запрос к LLM с обязательным JSON-ответом.
+func askLLMJSON(ctx context.Context, llm *openai.Client, model, prompt string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	resp, err := llm.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		Model:       model,
+		Temperature: 0,
+		Messages:    []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleUser, Content: prompt}},
+		ResponseFormat: &openai.ChatCompletionResponseFormat{
+			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("LLM: %w", err)
+	}
+	if len(resp.Choices) == 0 {
+		return nil, errors.New("LLM: no choices")
+	}
+	return []byte(strings.TrimSpace(resp.Choices[0].Message.Content)), nil
+}
+
+// serveMCP запускает MCP HTTP-сервер с дополнительным /healthz.
+func serveMCP(ctx context.Context, mcpSrv *server.MCPServer, listenAddr, endpointPath string) {
+	httpHandler := server.NewStreamableHTTPServer(mcpSrv,
+		server.WithEndpointPath(endpointPath),
+	)
+	mux := http.NewServeMux()
+	mux.Handle(endpointPath, httpHandler)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	srv := &http.Server{
+		Addr:              listenAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	done := make(chan error, 1)
+	go func() {
+		log.Printf("MCP server listening on %s%s", listenAddr, endpointPath)
+		done <- srv.ListenAndServe()
+	}()
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+	}()
+	if err := <-done; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("http: %v", err)
+	}
+	log.Printf("stopped")
+}
+
+// ── main ─────────────────────────────────────────────────────────────────────
+
 func main() {
-	// Чат идёт в stdout, всё остальное (служебные логи) — в stderr,
-	// чтобы не засорять вывод REPL.
 	log.SetOutput(os.Stderr)
-	log.SetPrefix("[agent-a] ")
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	role := Role(strings.ToUpper(strings.TrimSpace(os.Getenv("AGENT_ROLE"))))
+	if role == "" {
+		log.Fatal("AGENT_ROLE is required: PLAYER | CREATOR | CHECKER")
+	}
+	log.SetPrefix(fmt.Sprintf("[%s] ", role))
 
 	apiKey := firstNonEmpty(os.Getenv("MISTRAL_API_KEY"), os.Getenv("OPENAI_API_KEY"))
 	if apiKey == "" {
 		log.Fatal("MISTRAL_API_KEY is required")
 	}
-
 	model := firstNonEmpty(os.Getenv("MISTRAL_MODEL"), os.Getenv("OPENAI_MODEL"), defaultMistralModel)
+	baseURL := firstNonEmpty(os.Getenv("MISTRAL_BASE_URL"), os.Getenv("OPENAI_BASE_URL"), defaultMistralBaseURL)
 
-	baseURL := firstNonEmpty(
-		os.Getenv("MISTRAL_BASE_URL"),
-		os.Getenv("OPENAI_BASE_URL"),
-		defaultMistralBaseURL,
-	)
-	baseURL = strings.TrimRight(baseURL, "/")
-
-	agentBURL := firstNonEmpty(os.Getenv("AGENT_B_URL"), defaultAgentBURL)
+	llm := newLLMClient(apiKey, baseURL)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("using Mistral endpoint: %s (model=%s)", baseURL, model)
+	log.Printf("starting (model=%s)", model)
 
-	// MCP — опционален. Если agent-b недоступен, agent-a продолжает работать
-	// как обычный чат с LLM, без инструмента check_board.
-	mcpClient, oaiTools := tryConnectMCP(ctx, agentBURL)
-	if mcpClient != nil {
-		defer func() { _ = mcpClient.Close() }()
-		log.Printf("MCP ready: %d tool(s) available", len(oaiTools))
-	} else {
-		log.Printf("MCP unavailable — running standalone chat without tools")
+	switch role {
+	case RoleCreator:
+		runCreator(ctx, llm, model)
+	case RoleChecker:
+		runChecker(ctx, llm, model)
+	case RolePlayer:
+		runPlayer(ctx, llm, model)
+	default:
+		log.Fatalf("unknown AGENT_ROLE=%q", role)
 	}
-
-	mClient := newMistralClient(apiKey, baseURL)
-
-	runChat(ctx, mClient, mcpClient, model, oaiTools)
 }
 
-// tryConnectMCP пытается установить MCP-соединение с agent-b.
-// При успехе возвращает рабочий клиент и набор tools для chat completion.
-// При любой ошибке — (nil, nil): агент будет работать как обычный чат
-// без инструментов. Несколько коротких ретраев сглаживают compose-race
-// при одновременном старте контейнеров.
-func tryConnectMCP(ctx context.Context, agentBURL string) (*client.Client, []openai.Tool) {
-	log.Printf("trying MCP server agent-b at: %s", agentBURL)
+// ── CREATOR ───────────────────────────────────────────────────────────────────
+//
+// MCP-сервис на LISTEN_ADDR (default :9001), путь ENDPOINT_PATH (default /mcp).
+// Инструмент: generate_new_game(theme?) → {board, message}
+// LLM генерирует случайно перемешанную доску и напутствие для игрока.
 
-	mcpClient, err := client.NewStreamableHttpClient(agentBURL)
+func runCreator(ctx context.Context, llm *openai.Client, model string) {
+	listenAddr := firstNonEmpty(os.Getenv("LISTEN_ADDR"), ":9001")
+	endpointPath := firstNonEmpty(os.Getenv("ENDPOINT_PATH"), "/mcp")
+
+	s := server.NewMCPServer("agent-creator", "1.0.0",
+		server.WithToolCapabilities(false),
+		server.WithRecovery(),
+	)
+
+	s.AddTool(
+		mcp.NewTool("generate_new_game",
+			mcp.WithDescription(
+				"Создаёт новую игру «пятнашки»: LLM генерирует случайно перемешанную доску "+
+					"и напутствие для игрока. "+
+					"Возвращает {\"board\": string, \"message\": string}.",
+			),
+			mcp.WithString("theme",
+				mcp.Description("Необязательная тема напутствия (например, «загадочное», «мотивирующее»)."),
+			),
+		),
+		func(innerCtx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			argsMap, _ := req.Params.Arguments.(map[string]any)
+			if argsMap == nil {
+				argsMap = map[string]any{}
+			}
+			theme, _ := argsMap["theme"].(string)
+			if theme == "" {
+				theme = "азартное и бодрящее"
+			}
+
+			prompt := fmt.Sprintf(`Ты — агент-создатель игры «пятнашки» (15-puzzle, 4×4).
+
+Сгенерируй случайно перемешанное поле и напутствие для игрока.
+
+Правила поля:
+- 16 позиций: числа 1–15 и символ "_" (пустая клетка), каждое ровно по одному разу.
+- Поле должно быть хорошо перемешано, далеко от решённого: "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 _".
+- Формат: 16 токенов через пробел, слева направо, сверху вниз.
+- Пример: "5 1 2 3 9 6 7 4 13 10 11 8 14 15 12 _"
+
+Ответь строго JSON без markdown:
+{
+  "board": "<16 токенов через пробел>",
+  "message": "<напутствие игроку, стиль: %s, 2-3 предложения>"
+}`, theme)
+
+			raw, err := askLLMJSON(innerCtx, llm, model, prompt)
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("LLM failed", err), nil
+			}
+			log.Printf("generate_new_game → %s", raw)
+			return mcp.NewToolResultText(string(raw)), nil
+		},
+	)
+
+	serveMCP(ctx, s, listenAddr, endpointPath)
+}
+
+// ── CHECKER ───────────────────────────────────────────────────────────────────
+//
+// MCP-сервис на LISTEN_ADDR (default :9002), путь ENDPOINT_PATH (default /mcp).
+// Инструменты:
+//
+//	is_finished(board)           → {finished, reason}
+//	check_is_valid(board, tile)  → {valid, board, reason}
+//
+// Вся логика — через LLM.
+
+func runChecker(ctx context.Context, llm *openai.Client, model string) {
+	listenAddr := firstNonEmpty(os.Getenv("LISTEN_ADDR"), ":9002")
+	endpointPath := firstNonEmpty(os.Getenv("ENDPOINT_PATH"), "/mcp")
+
+	s := server.NewMCPServer("agent-checker", "1.0.0",
+		server.WithToolCapabilities(false),
+		server.WithRecovery(),
+	)
+
+	// is_finished — LLM сравнивает доску с решённым состоянием.
+	s.AddTool(
+		mcp.NewTool("is_finished",
+			mcp.WithDescription(
+				"Проверяет, решена ли игра «пятнашки». "+
+					"LLM сравнивает переданную доску с эталоном. "+
+					"Возвращает {\"finished\": bool, \"reason\": string}.",
+			),
+			mcp.WithString("board",
+				mcp.Required(),
+				mcp.Description("Текущая доска: 16 токенов через пробел."),
+			),
+		),
+		func(innerCtx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			board, err := req.RequireString("board")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			prompt := fmt.Sprintf(`Ты — агент-проверяющий игры «пятнашки» (15-puzzle, 4×4).
+
+Решённое поле: "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 _"
+Проверяемое поле: %q
+
+Определи, совпадает ли проверяемое поле с решённым (токен за токеном).
+Ответь строго JSON без markdown:
+{"finished": true|false, "reason": "краткое объяснение на русском"}`, board)
+
+			raw, err := askLLMJSON(innerCtx, llm, model, prompt)
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("LLM failed", err), nil
+			}
+			log.Printf("is_finished board=%q → %s", board, raw)
+			return mcp.NewToolResultText(string(raw)), nil
+		},
+	)
+
+	// check_is_valid — LLM проверяет ход и возвращает новую доску.
+	s.AddTool(
+		mcp.NewTool("check_is_valid",
+			mcp.WithDescription(
+				"Проверяет допустимость хода в «пятнашках». "+
+					"LLM определяет, соседствует ли фишка с пустой клеткой, "+
+					"и если да — возвращает новое состояние доски. "+
+					"Возвращает {\"valid\": bool, \"board\": string, \"reason\": string}.",
+			),
+			mcp.WithString("board",
+				mcp.Required(),
+				mcp.Description("Текущая доска: 16 токенов через пробел."),
+			),
+			mcp.WithNumber("tile",
+				mcp.Required(),
+				mcp.Description("Номер фишки (1-15), которую нужно переместить."),
+			),
+		),
+		func(innerCtx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			argsMap, _ := req.Params.Arguments.(map[string]any)
+			if argsMap == nil {
+				argsMap = map[string]any{}
+			}
+			board, _ := argsMap["board"].(string)
+			tile := argsMap["tile"]
+
+			prompt := fmt.Sprintf(`Ты — агент-проверяющий игры «пятнашки» (15-puzzle, 4×4).
+
+Текущее поле (16 токенов через пробел, слева направо, сверху вниз, по 4 в строке):
+%q
+
+Игрок хочет переместить фишку номер %v на пустую клетку "_".
+
+Правило: фишка может переместиться только если стоит непосредственно рядом
+с пустой клеткой (сверху, снизу, слева или справа — без диагоналей).
+
+Задачи:
+1. Найди позицию фишки %v и позицию "_" на поле.
+2. Проверь, являются ли они соседями по горизонтали или вертикали.
+3. Если ход валиден — поменяй фишку и "_" местами и запиши новое поле.
+
+Ответь строго JSON без markdown:
+{
+  "valid": true|false,
+  "board": "<новое поле если valid=true, иначе — исходное поле без изменений>",
+  "reason": "краткое объяснение на русском"
+}`, board, tile, tile)
+
+			raw, err := askLLMJSON(innerCtx, llm, model, prompt)
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("LLM failed", err), nil
+			}
+			log.Printf("check_is_valid tile=%v board=%q → %s", tile, board, raw)
+			return mcp.NewToolResultText(string(raw)), nil
+		},
+	)
+
+	serveMCP(ctx, s, listenAddr, endpointPath)
+}
+
+// ── PLAYER ────────────────────────────────────────────────────────────────────
+//
+// Интерактивный REPL. Подключается к mcp-server по MCP-протоколу.
+// Получает список инструментов через tools/list.
+// Вызывает инструменты через MCP — сервер роутит к нужному агенту.
+
+func connectMCP(ctx context.Context, mcpURL, name string) (*client.Client, error) {
+	log.Printf("connecting to MCP at %s", mcpURL)
+	c, err := client.NewStreamableHttpClient(mcpURL)
 	if err != nil {
-		log.Printf("MCP client init failed: %v", err)
-		return nil, nil
+		return nil, fmt.Errorf("new client: %w", err)
 	}
-
-	const maxAttempts = 6
-	const attemptDelay = 500 * time.Millisecond
-	var initRes *mcp.InitializeResult
-
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	for attempt := 1; attempt <= 10; attempt++ {
 		if ctx.Err() != nil {
-			break
+			_ = c.Close()
+			return nil, ctx.Err()
 		}
-
-		startCtx, cancelStart := context.WithTimeout(ctx, 3*time.Second)
-		startErr := mcpClient.Start(startCtx)
-		cancelStart()
+		startCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		startErr := c.Start(startCtx)
+		cancel()
 		if startErr != nil {
-			log.Printf("MCP start attempt %d/%d failed: %v", attempt, maxAttempts, startErr)
-			time.Sleep(attemptDelay)
+			log.Printf("start attempt %d/10: %v", attempt, startErr)
+			time.Sleep(800 * time.Millisecond)
 			continue
 		}
-
-		initCtx, cancelInit := context.WithTimeout(ctx, 5*time.Second)
-		initReq := mcp.InitializeRequest{}
-		initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
-		initReq.Params.ClientInfo = mcp.Implementation{
-			Name:    "agent-a",
-			Version: "1.0.0",
-		}
-		res, initErr := mcpClient.Initialize(initCtx, initReq)
-		cancelInit()
+		initCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		req := mcp.InitializeRequest{}
+		req.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+		req.Params.ClientInfo = mcp.Implementation{Name: name, Version: "1.0.0"}
+		res, initErr := c.Initialize(initCtx, req)
+		cancel()
 		if initErr != nil {
-			log.Printf("MCP initialize attempt %d/%d failed: %v", attempt, maxAttempts, initErr)
-			time.Sleep(attemptDelay)
+			log.Printf("init attempt %d/10: %v", attempt, initErr)
+			time.Sleep(800 * time.Millisecond)
 			continue
 		}
-		initRes = res
-		break
+		log.Printf("connected to %q v%s", res.ServerInfo.Name, res.ServerInfo.Version)
+		return c, nil
 	}
+	_ = c.Close()
+	return nil, errors.New("could not connect after 10 attempts")
+}
 
-	if initRes == nil {
-		_ = mcpClient.Close()
-		return nil, nil
-	}
-	log.Printf("connected to MCP server %q v%s", initRes.ServerInfo.Name, initRes.ServerInfo.Version)
+func runPlayer(ctx context.Context, llm *openai.Client, model string) {
+	mcpURL := firstNonEmpty(os.Getenv("GAME_SERVER_URL"), "http://mcp-server:9000/mcp")
 
-	listCtx, cancelList := context.WithTimeout(ctx, 5*time.Second)
-	toolsRes, err := mcpClient.ListTools(listCtx, mcp.ListToolsRequest{})
-	cancelList()
+	mcpClient, err := connectMCP(ctx, mcpURL, "player")
 	if err != nil {
-		log.Printf("MCP list tools failed: %v", err)
-		_ = mcpClient.Close()
-		return nil, nil
+		log.Fatalf("MCP server: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	// Получаем список инструментов с сервера и конвертируем для OpenAI.
+	listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	toolsRes, err := mcpClient.ListTools(listCtx, mcp.ListToolsRequest{})
+	cancel()
+	if err != nil {
+		log.Fatalf("ListTools: %v", err)
 	}
 
 	oaiTools := make([]openai.Tool, 0, len(toolsRes.Tools))
 	for _, t := range toolsRes.Tools {
 		schemaBytes, err := t.InputSchema.MarshalJSON()
 		if err != nil {
-			log.Printf("marshal schema for %s: %v (skipped)", t.Name, err)
 			continue
 		}
 		var params map[string]any
 		if err := json.Unmarshal(schemaBytes, &params); err != nil {
-			log.Printf("unmarshal schema for %s: %v (skipped)", t.Name, err)
 			continue
 		}
 		oaiTools = append(oaiTools, openai.Tool{
@@ -168,38 +413,77 @@ func tryConnectMCP(ctx context.Context, agentBURL string) (*client.Client, []ope
 				Parameters:  params,
 			},
 		})
-		log.Printf("discovered MCP tool: %s — %s", t.Name, t.Description)
+		log.Printf("tool from server: %s", t.Name)
 	}
 
-	if len(oaiTools) == 0 {
-		// Сервер ответил, но инструментов в нём нет — нет смысла тянуть
-		// клиент дальше, всё равно работаем как plain chat.
-		_ = mcpClient.Close()
-		return nil, nil
+	// Все вызовы идут через MCP-клиент к mcp-server.
+	// Сервер сам решает, к какому агенту (CREATOR / CHECKER) маршрутизировать.
+	dispatch := func(ctx context.Context, toolName string, args map[string]any) (string, error) {
+		callCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		defer cancel()
+		req := mcp.CallToolRequest{}
+		req.Params.Name = toolName
+		req.Params.Arguments = args
+		res, err := mcpClient.CallTool(callCtx, req)
+		if err != nil {
+			return "", fmt.Errorf("MCP CallTool %s: %w", toolName, err)
+		}
+		var sb strings.Builder
+		for _, item := range res.Content {
+			if t, ok := mcp.AsTextContent(item); ok {
+				sb.WriteString(t.Text)
+			}
+		}
+		body := sb.String()
+		if res.IsError {
+			return "", fmt.Errorf("tool %s error: %s", toolName, body)
+		}
+		return body, nil
 	}
 
-	return mcpClient, oaiTools
+	systemPrompt := `Ты — агент-игрок в «пятнашки» (15-puzzle, 4×4 поле).
+Цель: привести доску к решённому состоянию:
+  1  2  3  4
+  5  6  7  8
+  9  10 11 12
+  13 14 15  _
+
+Инструменты предоставлены MCP-сервером (он роутит вызовы к агентам):
+• get_state        — посмотреть текущую доску
+• new_game         — создать новую игру (→ агент CREATOR: generate_new_game)
+• is_finished      — проверить завершённость (→ агент CHECKER: is_finished)
+• move(tile)       — переместить фишку (→ агент CHECKER: check_is_valid, сервер сохраняет)
+
+Всегда начинай с get_state. Анализируй доску и делай ходы по одному.`
+
+	runChatREPL(ctx, llm, model, oaiTools, systemPrompt, "PLAYER", dispatch)
 }
 
-func runChat(
+// ── REPL ─────────────────────────────────────────────────────────────────────
+
+type toolDispatcher func(ctx context.Context, toolName string, args map[string]any) (string, error)
+
+func runChatREPL(
 	ctx context.Context,
-	mClient *openai.Client,
-	mcpClient *client.Client,
+	llm *openai.Client,
 	model string,
-	oaiTools []openai.Tool,
+	tools []openai.Tool,
+	systemPrompt string,
+	prefix string,
+	dispatch toolDispatcher,
 ) {
 	var messages []openai.ChatCompletionMessage
-
-	fmt.Println("agent-a: чат готов. Просто пиши, что хочешь.")
-	if len(oaiTools) > 0 {
-		fmt.Println("         (если попросишь проверить поле «пятнашек» — схожу к agent-b по MCP)")
-	} else {
-		fmt.Println("         (agent-b недоступен — работаю как обычный чат, без инструментов)")
+	if systemPrompt != "" {
+		messages = append(messages, openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleSystem,
+			Content: systemPrompt,
+		})
 	}
-	fmt.Println("         /reset — очистить историю, /exit или Ctrl+D — выйти.")
+
+	fmt.Printf("%s: чат готов. Пишите сообщения.\n", prefix)
+	fmt.Println("  /reset — очистить историю, /exit — выйти.")
 
 	reader := bufio.NewReader(os.Stdin)
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -208,14 +492,14 @@ func runChat(
 		default:
 		}
 
-		fmt.Print("\nyou> ")
+		fmt.Printf("\nyou> ")
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				fmt.Println()
 				return
 			}
-			log.Printf("stdin read error: %v", err)
+			log.Printf("stdin: %v", err)
 			return
 		}
 		line = strings.TrimSpace(line)
@@ -226,8 +510,8 @@ func runChat(
 		case "/exit", "/quit":
 			return
 		case "/reset":
-			messages = nil
-			fmt.Println("agent-a: история очищена.")
+			messages = messages[:1]
+			fmt.Printf("%s: история очищена.\n", prefix)
 			continue
 		}
 
@@ -235,51 +519,40 @@ func runChat(
 			Role:    openai.ChatMessageRoleUser,
 			Content: line,
 		})
-
-		messages = runToolLoop(ctx, mClient, mcpClient, model, oaiTools, messages)
+		messages = runToolLoop(ctx, llm, model, tools, messages, prefix, dispatch)
 	}
 }
 
-// runToolLoop крутит цикл «модель → возможные tool_calls → MCP → модель»
-// до тех пор, пока модель не ответит обычным текстом или не упрётся в лимит шагов.
-// Если oaiTools пуст или mcpClient nil, цикл фактически вырождается в один
-// LLM-запрос без инструментов: модель просто отвечает текстом.
-// Возвращает обновлённую историю сообщений.
 func runToolLoop(
 	ctx context.Context,
-	mClient *openai.Client,
-	mcpClient *client.Client,
+	llm *openai.Client,
 	model string,
-	oaiTools []openai.Tool,
+	tools []openai.Tool,
 	messages []openai.ChatCompletionMessage,
+	prefix string,
+	dispatch toolDispatcher,
 ) []openai.ChatCompletionMessage {
-	const maxSteps = 6
+	const maxSteps = 20
 	for step := 0; step < maxSteps; step++ {
-		callCtx, cancelCall := context.WithTimeout(ctx, 90*time.Second)
-		req := openai.ChatCompletionRequest{
+		callCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		resp, err := llm.CreateChatCompletion(callCtx, openai.ChatCompletionRequest{
 			Model:       model,
-			Temperature: 0.7,
+			Temperature: 0.4,
 			Messages:    messages,
-		}
-		if len(oaiTools) > 0 {
-			req.Tools = oaiTools
-		}
-		resp, err := mClient.CreateChatCompletion(callCtx, req)
-		cancelCall()
+			Tools:       tools,
+		})
+		cancel()
 		if err != nil {
-			log.Printf("llm error: %v", err)
-			fmt.Printf("agent-a> [ошибка LLM: %v]\n", err)
+			log.Printf("LLM: %v", err)
+			fmt.Printf("%s> [ошибка LLM: %v]\n", prefix, err)
 			return messages
 		}
 		if len(resp.Choices) == 0 {
-			log.Printf("llm returned no choices")
-			fmt.Println("agent-a> [пустой ответ модели]")
+			fmt.Printf("%s> [пустой ответ модели]\n", prefix)
 			return messages
 		}
 
 		msg := resp.Choices[0].Message
-		// Mistral строго требует, чтобы у каждого tool_call поле type было "function".
-		// Клиент go-openai иногда оставляет его пустым — выставим явно.
 		for i := range msg.ToolCalls {
 			if msg.ToolCalls[i].Type == "" {
 				msg.ToolCalls[i].Type = openai.ToolTypeFunction
@@ -292,75 +565,35 @@ func runToolLoop(
 			if content == "" {
 				content = "(пустой ответ)"
 			}
-			fmt.Printf("agent-a> %s\n", content)
+			fmt.Printf("%s> %s\n", prefix, content)
 			return messages
 		}
 
 		for _, tc := range msg.ToolCalls {
-			log.Printf("→ MCP tool %s args=%s", tc.Function.Name, tc.Function.Arguments)
-
 			var args map[string]any
-			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-				log.Printf("bad args from llm: %v", err)
+			_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+			if args == nil {
 				args = map[string]any{}
 			}
+			log.Printf("→ tool=%s args=%s", tc.Function.Name, tc.Function.Arguments)
 
-			toolText := callMCPTool(ctx, mcpClient, tc.Function.Name, args)
-			log.Printf("← MCP tool %s result=%s", tc.Function.Name, toolText)
+			result, err := dispatch(ctx, tc.Function.Name, args)
+			if err != nil {
+				result = fmt.Sprintf(`{"error":%q}`, err.Error())
+				log.Printf("← tool=%s error: %v", tc.Function.Name, err)
+			} else {
+				log.Printf("← tool=%s result=%s", tc.Function.Name, result)
+			}
 
 			messages = append(messages, openai.ChatCompletionMessage{
 				Role:       openai.ChatMessageRoleTool,
-				Content:    toolText,
+				Content:    result,
 				ToolCallID: tc.ID,
 			})
 		}
 	}
 
-	log.Printf("tool loop exceeded maxSteps")
-	fmt.Println("agent-a> [превышен лимит шагов tool-calling]")
+	log.Printf("tool loop exceeded maxSteps=%d", maxSteps)
+	fmt.Printf("%s> [превышен лимит шагов]\n", prefix)
 	return messages
-}
-
-func newMistralClient(apiKey, baseURL string) *openai.Client {
-	cfg := openai.DefaultConfig(apiKey)
-	if baseURL != "" {
-		cfg.BaseURL = baseURL
-	}
-	return openai.NewClientWithConfig(cfg)
-}
-
-func callMCPTool(ctx context.Context, c *client.Client, name string, args map[string]any) string {
-	if c == nil {
-		// Защита: модель попыталась позвать инструмент, но MCP-клиента нет.
-		// На практике сюда не попадаем, потому что в этом случае oaiTools пуст
-		// и модель не получает описания инструментов.
-		return `{"error": "MCP-клиент недоступен"}`
-	}
-
-	callCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-	defer cancel()
-
-	req := mcp.CallToolRequest{}
-	req.Params.Name = name
-	req.Params.Arguments = args
-
-	res, err := c.CallTool(callCtx, req)
-	if err != nil {
-		return fmt.Sprintf(`{"error": %q}`, err.Error())
-	}
-
-	var sb strings.Builder
-	for _, c := range res.Content {
-		if t, ok := mcp.AsTextContent(c); ok {
-			sb.WriteString(t.Text)
-		}
-	}
-	body := sb.String()
-	if body == "" {
-		body = "{}"
-	}
-	if res.IsError {
-		return fmt.Sprintf(`{"error": %q}`, body)
-	}
-	return body
 }

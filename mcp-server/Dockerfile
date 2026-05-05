@@ -11,19 +11,19 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/agent-b .
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/mcp-server .
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates wget && adduser -D -u 10001 app
 USER app
 WORKDIR /app
-COPY --from=build /out/agent-b /app/agent-b
+COPY --from=build /out/mcp-server /app/mcp-server
 
-ENV AGENT_B_LISTEN_ADDR=":8080" \
-    AGENT_B_ENDPOINT_PATH="/mcp"
-EXPOSE 8080
+ENV LISTEN_ADDR=":9000" \
+    ENDPOINT_PATH="/mcp"
+EXPOSE 9000
 
 HEALTHCHECK --interval=10s --timeout=3s --retries=5 --start-period=5s \
-    CMD wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1
+    CMD wget -qO- http://127.0.0.1:9000/healthz >/dev/null 2>&1 || exit 1
 
-ENTRYPOINT ["/app/agent-b"]
+ENTRYPOINT ["/app/mcp-server"]

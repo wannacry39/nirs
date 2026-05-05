@@ -1,83 +1,137 @@
-name: new-mcp-server
+name: puzzle-agents
 
-# Архитектура запуска:
-#  - agent-b — MCP-сервер, поднимается фоном (docker compose up -d agent-b).
-#  - agent-a — интерактивный чат: запускается через `docker compose run --rm agent-a`.
-#  - agent-b-chat — отдельный сервис, запускающий тот же образ agent-b
-#    в режиме REPL-чата (AGENT_B_CHAT=1, без HTTP-порта). Тоже через `run`.
+# Архитектура (каждый компонент в отдельном контейнере):
 #
-# Агенты намеренно НЕ связаны жёстко: если agent-b не запущен, agent-a
-# просто стартует в standalone-режиме как обычный чат с LLM (без
-# инструмента check_board). Поэтому ни depends_on, ни service_healthy
-# здесь не нужны.
+#   creator    — HTTP-агент (AGENT_ROLE=CREATOR), порт 9001.
+#                POST /create_game → LLM генерирует доску + напутствие.
+#                Никакого MCP-кода.
+#
+#   checker    — HTTP-агент (AGENT_ROLE=CHECKER), порт 9002.
+#                POST /check_finished → LLM проверяет завершённость.
+#                POST /check_move     → LLM валидирует ход + возвращает новое поле.
+#                Никакого MCP-кода.
+#
+#   mcp-server — единственный компонент с MCP-кодом.
+#                Хранит состояние доски в памяти.
+#                Принимает MCP-запросы от player (порт 9000, /mcp).
+#                Принимает REST-запросы от player (порт 9000, /api/*).
+#                Роутит к creator и checker через обычный HTTP.
+#
+#   player     — интерактивный REPL (AGENT_ROLE=PLAYER).
+#                LLM принимает решения: какой инструмент вызвать, какую фишку двигать.
+#                Вызывает REST API mcp-server (/api/*) через net/http — без MCP-кода.
+#
+# Порядок запуска:
+#   creator и checker стартуют первыми (healthcheck на /healthz).
+#   mcp-server ждёт их через depends_on: condition: service_healthy.
+#   player запускается вручную через docker compose run.
+#
+# Команды:
+#   docker compose up -d creator checker mcp-server
+#   docker compose run --rm player
 
 services:
-  agent-b:
-    build:
-      context: ./agent-b
-    image: new-mcp-server/agent-b:latest
-    container_name: agent-b
-    environment:
-      MISTRAL_API_KEY: ${MISTRAL_API_KEY:?set MISTRAL_API_KEY in .env or shell}
-      MISTRAL_MODEL: ${MISTRAL_MODEL:-mistral-small-latest}
-      MISTRAL_BASE_URL: ${MISTRAL_BASE_URL:-https://api.mistral.ai/v1}
-      AGENT_B_LISTEN_ADDR: ":8080"
-      AGENT_B_ENDPOINT_PATH: "/mcp"
-      # AGENT_B_CHAT не выставлен — это «серверный» инстанс.
-    networks:
-      - mcpnet
-    # Порт пробрасываем только для отладки/curl с хоста.
-    # Для связи между контейнерами он не нужен — agent-a ходит к agent-b
-    # по внутреннему DNS-имени docker-сети.
-    ports:
-      - "8080:8080"
-    restart: unless-stopped
 
-  agent-a:
+  # ── агент-создатель ─────────────────────────────────────────────────────────
+  creator:
     build:
       context: ./agent-a
-    image: new-mcp-server/agent-a:latest
-    container_name: agent-a
-    profiles: ["interactive"]
+    image: puzzle/agent:latest
+    container_name: creator
     environment:
-      MISTRAL_API_KEY: ${MISTRAL_API_KEY:?set MISTRAL_API_KEY in .env or shell}
+      AGENT_ROLE: "CREATOR"
+      LISTEN_ADDR: ":9001"
+      ENDPOINT_PATH: "/mcp"
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:?set MISTRAL_API_KEY in .env}
       MISTRAL_MODEL: ${MISTRAL_MODEL:-mistral-small-latest}
       MISTRAL_BASE_URL: ${MISTRAL_BASE_URL:-https://api.mistral.ai/v1}
-      AGENT_B_URL: "http://agent-b:8080/mcp"
     networks:
-      - mcpnet
-    stdin_open: true
-    tty: true
-    restart: "no"
-
-  # Тот же образ, что и agent-b, но запущен в режиме REPL-чата
-  # (без HTTP-сервера снаружи). Нужен только когда хочется поговорить
-  # с «персонажем-чекером» напрямую, не через agent-a.
-  agent-b-chat:
-    image: new-mcp-server/agent-b:latest
-    build:
-      context: ./agent-b
-    container_name: agent-b-chat
-    profiles: ["interactive"]
-    environment:
-      MISTRAL_API_KEY: ${MISTRAL_API_KEY:?set MISTRAL_API_KEY in .env or shell}
-      MISTRAL_MODEL: ${MISTRAL_MODEL:-mistral-small-latest}
-      MISTRAL_BASE_URL: ${MISTRAL_BASE_URL:-https://api.mistral.ai/v1}
-      AGENT_B_CHAT: "1"
-      # Слушаем на нестандартном порту, чтобы не конфликтовать с
-      # основным фоновым agent-b. Порт наружу не пробрасываем.
-      AGENT_B_LISTEN_ADDR: ":18080"
-    networks:
-      - mcpnet
-    stdin_open: true
-    tty: true
-    restart: "no"
-    # HEALTHCHECK в Dockerfile прибит к порту 8080. В этом сервисе мы слушаем
-    # 18080, поэтому baked-in healthcheck тут всегда был бы unhealthy.
-    # Нам он и не нужен: на agent-b-chat никто не завязывается через depends_on.
+      - puzzlenet
+    ports:
+      - "9001:9001"
+    restart: unless-stopped
     healthcheck:
-      disable: true
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9001/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # ── агент-проверяющий ───────────────────────────────────────────────────────
+  checker:
+    build:
+      context: ./agent-a
+    image: puzzle/agent:latest
+    container_name: checker
+    environment:
+      AGENT_ROLE: "CHECKER"
+      LISTEN_ADDR: ":9002"
+      ENDPOINT_PATH: "/mcp"
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:?set MISTRAL_API_KEY in .env}
+      MISTRAL_MODEL: ${MISTRAL_MODEL:-mistral-small-latest}
+      MISTRAL_BASE_URL: ${MISTRAL_BASE_URL:-https://api.mistral.ai/v1}
+    networks:
+      - puzzlenet
+    ports:
+      - "9002:9002"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9002/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # ── MCP-роутер + хранилище ─────────────────────────────────────────────────
+  mcp-server:
+    build:
+      context: ./mcp-server
+    image: puzzle/mcp-server:latest
+    container_name: mcp-server
+    environment:
+      LISTEN_ADDR: ":9000"
+      ENDPOINT_PATH: "/mcp"
+      CREATOR_URL: "http://creator:9001/mcp"
+      CHECKER_URL: "http://checker:9002/mcp"
+    networks:
+      - puzzlenet
+    ports:
+      - "9000:9000"
+    restart: unless-stopped
+    depends_on:
+      creator:
+        condition: service_healthy
+      checker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # ── агент-игрок (интерактивный) ─────────────────────────────────────────────
+  player:
+    build:
+      context: ./agent-a
+    image: puzzle/agent:latest
+    container_name: player
+    profiles: ["interactive"]
+    environment:
+      AGENT_ROLE: "PLAYER"
+      GAME_SERVER_URL: "http://mcp-server:9000/mcp"
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:?set MISTRAL_API_KEY in .env}
+      MISTRAL_MODEL: ${MISTRAL_MODEL:-mistral-small-latest}
+      MISTRAL_BASE_URL: ${MISTRAL_BASE_URL:-https://api.mistral.ai/v1}
+    networks:
+      - puzzlenet
+    stdin_open: true
+    tty: true
+    restart: "no"
+    depends_on:
+      mcp-server:
+        condition: service_healthy
 
 networks:
-  mcpnet:
+  puzzlenet:
     driver: bridge
